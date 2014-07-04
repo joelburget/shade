@@ -12,22 +12,26 @@ import Haste.Prim (JSString, fromJSStr)
 import Shade.Core
 import qualified Shade.Haste.Internal.React as R
 
--- a is the return type of the Async. various "i" sources can trigger it, and various handlers can be installed into the callback.
--- the callback is i -> IO () because the actual buttons ec will call it with their triggering data. "listen" ensures it's converted to an 'a'
--- We could have the atuall callbacks use the i->a function too, but probably same difference?
+-- a is the return type of the Async. various "i" sources can trigger it,
+-- and various handlers can be installed into the callback.
+-- the callback is i -> IO () because the actual buttons etc will call it
+-- with their triggering data. "listen" ensures it's converted to an 'a'
+-- We could have the actual callbacks use the i->a function too, but
+-- probably same difference?
 data AsyncSource a = forall i . AsyncSource (i -> a, MVar [i -> IO ()])
 data AsyncImpl a = AsyncImpl [AsyncSource a]
 
 instance Functor AsyncImpl where
-  fmap f (AsyncImpl as) = AsyncImpl (map (\(AsyncSource (a,b)) -> AsyncSource (f . a, b)) as)
-  
+  fmap f (AsyncImpl as) = AsyncImpl $ map f' as
+  where f' (AsyncSource (a, b)) = AsyncSource (f . a, b)
+
 instance FireFirst AsyncImpl where
   fireFirst as = AsyncImpl (concat (map unwrap as))
     where
       unwrap (AsyncImpl v) = v
 
 mkAsyncs :: IO ([(R.EventHandler, IO Bool)], ElemAsyncs ShadeHaste)
-mkAsyncs = 
+mkAsyncs =
   do (mvClick, asClick) <- mkMVar
      (mvDoubleClick, asDoubleClick) <- mkMVar
      (mvChange, asChange) <- mkMVar
@@ -71,14 +75,14 @@ defaultElement constructor attrs children =
                             mcbs <- listenedCallbacks callbacks
                             (constructor attrs (catMaybes mcbs) c)))
                   return asyncs
-  
+
 voidElement constructor attrs =
   ShadeHaste $ do (callbacks, asyncs) <- liftIO mkAsyncs
                   tell (D.singleton
                         (do mcbs <- listenedCallbacks callbacks
                             (constructor attrs (catMaybes mcbs))))
                   return asyncs
-  
+
 instance ToString JSString where
   toString = fromJSStr
 
@@ -115,7 +119,7 @@ runClient c = do (s, cs) <- runWriterT (runShadeHaste c)
                  return (s, D.toList cs)
 
 renderClient :: Elem -> [IO R.React] -> IO ()
-renderClient e rs = 
+renderClient e rs =
   do putStrLn "Rendering."
      relts <- sequence rs
      case relts of
