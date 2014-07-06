@@ -2,6 +2,7 @@
 module Shade.Haste.Internal.Core where
 import Control.Applicative (Applicative)
 import Control.Concurrent.MVar (MVar, newMVar, readMVar, modifyMVar_)
+import Control.Monad (void)
 import Control.Monad.Trans (liftIO)
 import Control.Monad.Trans.Writer.Strict (WriterT, runWriterT, tell)
 import Data.DList (DList)
@@ -23,10 +24,10 @@ data AsyncImpl a = AsyncImpl [AsyncSource a]
 
 instance Functor AsyncImpl where
   fmap f (AsyncImpl as) = AsyncImpl $ map f' as
-  where f' (AsyncSource (a, b)) = AsyncSource (f . a, b)
+    where f' (AsyncSource (a, b)) = AsyncSource (f . a, b)
 
 instance FireFirst AsyncImpl where
-  fireFirst as = AsyncImpl (concat (map unwrap as))
+  fireFirst as = AsyncImpl $ concatMap unwrap as
     where
       unwrap (AsyncImpl v) = v
 
@@ -47,81 +48,93 @@ mkAsyncs =
               ,(R.onKeyDown (fire mvKeyDown), someListeners mvKeyDown)
               ,(R.onBlur (fire mvBlur), someListeners mvBlur)
               ]
-            , (ElemAsyncs { onClick = asClick
-                          , onDoubleClick = asDoubleClick
-                          , onChange = asChange
-                          , onKeyUp = asKeyUp
-                          , onKeyPress = asKeyPress
-                          , onKeyDown = asKeyDown
-                          , onBlur = asBlur}))
+            , ElemAsyncs { onClick = asClick
+                         , onDoubleClick = asDoubleClick
+                         , onChange = asChange
+                         , onKeyUp = asKeyUp
+                         , onKeyPress = asKeyPress
+                         , onKeyDown = asKeyDown
+                         , onBlur = asBlur})
   where
     mkMVar = do mv <- newMVar []
                 return (mv, AsyncImpl [AsyncSource (id, mv)])
     fire mv evt = do cbs <- readMVar mv
-                     sequence_ (map ($! evt) cbs) -- React pools and wrecks existing event objects, so we have to strictly read them asap.
+                     mapM_ ($! evt) cbs -- React pools and wrecks existing event objects, so we have to strictly read them asap.
     someListeners mv = fmap (not . null) (readMVar mv)
 
 
-listenedCallbacks cbs = mapM (\(h,s) -> do some <- s
-                                           if some
-                                             then return (Just h)
-                                             else return Nothing) cbs
+listenedCallbacks = mapM $ \(h,s) -> do
+    some <- s
+    return $ if some
+      then Just h
+      else Nothing
 
+defaultElement :: (t -> [R.EventHandler] -> [R.React] -> IO R.React)
+               -> t
+               -> ShadeHaste a
+               -> ShadeHaste (ElemAsyncs ShadeHaste)
 defaultElement constructor attrs children =
   ShadeHaste $ do (_, chlds) <- liftIO (runWriterT (runShadeHaste children))
                   (callbacks, asyncs) <- liftIO mkAsyncs
                   tell (D.singleton
-                        (do c <- (sequence (D.toList chlds))
+                        (do c <- sequence (D.toList chlds)
                             mcbs <- listenedCallbacks callbacks
-                            (constructor attrs (catMaybes mcbs) c)))
+                            constructor attrs (catMaybes mcbs) c))
                   return asyncs
 
+voidElement :: (t -> [R.EventHandler] -> IO R.React)
+            -> t
+            -> ShadeHaste (ElemAsyncs ShadeHaste)
 voidElement constructor attrs =
   ShadeHaste $ do (callbacks, asyncs) <- liftIO mkAsyncs
                   tell (D.singleton
                         (do mcbs <- listenedCallbacks callbacks
-                            (constructor attrs (catMaybes mcbs))))
+                            constructor attrs (catMaybes mcbs)))
                   return asyncs
 
 instance ToString JSString where
   toString = fromJSStr
 
-newtype ShadeHaste a = ShadeHaste {runShadeHaste :: WriterT (DList (IO R.React)) IO a} deriving (Functor, Applicative, Monad)
+newtype ShadeHaste a = ShadeHaste {
+    runShadeHaste :: WriterT (DList (IO R.React)) IO a
+    } deriving (Functor, Applicative, Monad)
 
 instance Shade ShadeHaste where
   type Async ShadeHaste = AsyncImpl
   type NativeString ShadeHaste = JSString
   type NativeElem ShadeHaste = Elem
-  button a c = defaultElement R.button a c
-  div a c = defaultElement R.div a c
-  header a c = defaultElement R.header a c
-  h1 a c = defaultElement R.h1 a c
-  section a c = defaultElement R.section a c
-  ul a c = defaultElement R.ul a c
-  li a c = defaultElement R.li a c
-  label a c = defaultElement R.label a c
-  footer a c = defaultElement R.footer a c
-  span a c = defaultElement R.span a c
-  strong a c = defaultElement R.strong a c
-  a attrs c = defaultElement R.a attrs c
-  input a = voidElement R.input a
-  text s = ShadeHaste ((tell (D.singleton (R.text s))) >> return ())
+  button = defaultElement R.button
+  div = defaultElement R.div
+  header = defaultElement R.header
+  h1 = defaultElement R.h1
+  section = defaultElement R.section
+  ul = defaultElement R.ul
+  li = defaultElement R.li
+  label = defaultElement R.label
+  footer = defaultElement R.footer
+  span = defaultElement R.span
+  strong = defaultElement R.strong
+  a = defaultElement R.a
+  input = voidElement R.input
+  text s = ShadeHaste $ void (tell (D.singleton (R.text s)))
   letElt c = ShadeHaste $ do (s, chlds) <- liftIO (runWriterT (runShadeHaste c))
                              return (s, ShadeHaste (tell chlds >> return s))
 
 listen :: AsyncImpl a -> (a -> IO ()) -> IO ()
 listen (AsyncImpl as) callb = mapM_ addCB as
   where
-    addCB (AsyncSource (itoa, mv)) = modifyMVar_ mv (\cbs -> return ( (callb . itoa) : cbs))
+    addCB (AsyncSource (itoa, mv)) = modifyMVar_ mv $ return . ((callb . itoa):)
 
 runClient :: ShadeHaste a -> IO (a, [IO R.React])
-runClient c = do (s, cs) <- runWriterT (runShadeHaste c)
-                 return (s, D.toList cs)
+runClient c = do
+    (s, cs) <- runWriterT (runShadeHaste c)
+    return (s, D.toList cs)
 
 renderClient :: Elem -> [IO R.React] -> IO ()
-renderClient e rs =
-  do putStrLn "Rendering."
-     relts <- sequence rs
-     case relts of
-        (a:_) -> R.renderComponent e a -- TODO: Just attaching first thing at the toplevel. Defensive div wrapper? is multiple OK?
+renderClient e rs = do
+    relts <- sequence rs
+    case relts of
+        -- TODO: Just attaching first thing at the toplevel. Defensive div
+        -- wrapper? is multiple OK?
+        (a:_) -> R.renderComponent e a
         _ -> return ()
